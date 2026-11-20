@@ -11,17 +11,18 @@ use super::jni_utils::{
     uuid::JUuid,
 };
 use crate::{
-    Error, Result,
     api::{
         self, BDAddr, Characteristic, ConnectionParameterPreset, ConnectionParameters, Descriptor,
         PeripheralProperties, Service, ValueNotification, WriteType,
     },
+    Error, Result,
 };
 use async_trait::async_trait;
 use futures::stream::Stream;
 use jni::{
-    Env, jni_sig, jni_str,
+    jni_sig, jni_str,
     objects::{Global, JObject, JString, JThrowable, JValue},
+    Env,
 };
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,10 @@ impl Display for PeripheralId {
         Display::fmt(&self.0, f)
     }
 }
+
+/// Historical droidplug default: request the largest legal ATT MTU after
+/// every successful `connect` unless the caller calls [`Peripheral::set_connect_mtu`].
+const DEFAULT_CONNECT_MTU: u16 = 517;
 
 fn get_poll_result<'a>(
     env: &mut Env<'a>,
@@ -148,6 +153,9 @@ pub struct Peripheral {
     internal: Arc<Global<JObject<'static>>>,
     shared: Arc<Mutex<PeripheralShared>>,
     mtu: Arc<AtomicU16>,
+    /// ATT MTU requested automatically after `connect`. `None` skips the
+    /// request. Defaults to `Some(517)` to preserve existing fork behaviour.
+    connect_mtu: Arc<Mutex<Option<u16>>>,
 }
 
 impl Peripheral {
@@ -163,6 +171,40 @@ impl Peripheral {
                 properties: None,
             })),
             mtu: Arc::new(AtomicU16::new(crate::api::DEFAULT_MTU_SIZE)),
+            connect_mtu: Arc::new(Mutex::new(Some(DEFAULT_CONNECT_MTU))),
+        })
+    }
+
+    /// ATT MTU automatically requested after a successful `connect`.
+    ///
+    /// `None` skips the automatic request. The default is [`DEFAULT_CONNECT_MTU`]
+    /// (517), the previous hardcoded value.
+    pub fn set_connect_mtu(&self, mtu: Option<u16>) {
+        *self.connect_mtu.lock().unwrap() = mtu;
+    }
+
+    /// Current automatic connect-time ATT MTU request, if any.
+    pub fn connect_mtu(&self) -> Option<u16> {
+        *self.connect_mtu.lock().unwrap()
+    }
+
+    /// Requests an ATT MTU on the connected link and updates the cached
+    /// [`Peripheral::mtu`](api::Peripheral::mtu) value.
+    pub async fn request_mtu(&self, mtu: u16) -> Result<u16> {
+        let mtu_future = self.with_obj(|env, obj| {
+            let mtu_obj = obj.request_mtu(env, i32::from(mtu))?;
+            let mtu_future = env.cast_local::<JFuture>(mtu_obj)?;
+            Ok(JSendFuture::new(env, &mtu_future)?)
+        })?;
+        let mtu_result_ref = mtu_future.await?;
+        self.with_obj(|env, _obj| -> Result<u16> {
+            let mtu_obj = get_poll_result(env, &mtu_result_ref)?;
+            let mtu_val = env
+                .call_method(&mtu_obj, jni_str!("intValue"), jni_sig!("()I"), &[])?
+                .i()?;
+            let negotiated = mtu_val as u16;
+            self.mtu.store(negotiated, Ordering::Relaxed);
+            Ok(negotiated)
         })
     }
 
@@ -250,22 +292,11 @@ impl api::Peripheral for Peripheral {
             }
             Ok(())
         })?;
-        // Auto-negotiate maximum MTU (517) after connection
-        {
-            let mtu_future = self.with_obj(|env, obj| {
-                let mtu_obj = obj.request_mtu(env, 517)?;
-                let mtu_future = env.cast_local::<JFuture>(mtu_obj)?;
-                Ok(JSendFuture::new(env, &mtu_future)?)
-            })?;
-            let mtu_result_ref = mtu_future.await?;
-            self.with_obj(|env, _obj| -> Result<()> {
-                let mtu_obj = get_poll_result(env, &mtu_result_ref)?;
-                let mtu_val = env
-                    .call_method(&mtu_obj, jni_str!("intValue"), jni_sig!("()I"), &[])?
-                    .i()?;
-                self.mtu.store(mtu_val as u16, Ordering::Relaxed);
-                Ok(())
-            })?;
+        // Automatically request the configured connect-time ATT MTU (default
+        // 517). `set_connect_mtu(None)` skips this so the caller can request
+        // a different value, or none, itself.
+        if let Some(mtu) = self.connect_mtu() {
+            self.request_mtu(mtu).await?;
         }
         Ok(())
     }
